@@ -1,0 +1,9 @@
+["<THOUGHT>","</THOUGHT>","<CONTEXT>", "</CONTEXT>", "<THOUGHT_CONTEXT>","<STRATEGY>", "</STRATEGY>","<THOUGHT_STRATEGY>","<PLAN_SEPARATOR/>", "<STEP_1>", "</STEP_1>","<T_1>",
+  "<STEP_2>", "</STEP_2>","<T_2>","<STEP_3>", "</STEP_3>","<T_3>","<STEP_4>", "</STEP_4>","<T_4>","<STEP_5>", "</STEP_5>","<T_5>",
+  "<STEP_6>", "</STEP_6>","<T_6>","<STEP_7>", "</STEP_7>","<T_7>","<STEP_8>", "</STEP_8>","<T_8>","<STEP_9>", "</STEP_9>","<T_9>",
+  "<THOUGHT_CONTEXT_a>","<THOUGHT_CONTEXT_b>","<THOUGHT_CONTEXT_c>",
+  "<THOUGHT_STRATEGY_a>","<THOUGHT_STRATEGY_b>","<THOUGHT_STRATEGY_c>",
+  "<T_1_a>","<T_1_b>","<T_1_c>","<T_2_a>","<T_2_b>","<T_2_c>","<T_3_a>","<T_3_b>","<T_3_c>",
+  "<T_4_a>","<T_4_b>","<T_4_c>","<T_5_a>","<T_5_b>","<T_5_c>","<T_6_a>","<T_6_b>","<T_6_c>",
+  "<T_7_a>","<T_7_b>","<T_7_c>","<T_8_a>","<T_8_b>","<T_8_c>","<T_9_a>","<T_9_b>","<T_9_c>"
+]

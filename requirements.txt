@@ -1,0 +1,7 @@
+torch>=2.6.0
+transformers>=4.51.0
+accelerate>=1.0.0
+deepspeed>=0.17.1
+numpy>=1.25.0
+pandas
+safetensors
