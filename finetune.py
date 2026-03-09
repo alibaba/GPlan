@@ -182,7 +182,7 @@ def finetune(args):
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     ddp = world_size != 1
-    local_rank = int(os.environ.get("RANK") or 0)
+    local_rank = int(os.environ.get("LOCAL_RANK") or 0)
     device = torch.device(local_rank)
 
     if ddp:

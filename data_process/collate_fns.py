@@ -157,15 +157,7 @@ class ProgressiveCotDistillCollater:
         if not raw_output:
             return None
 
-        try:
-            decoded_str = codecs.decode(raw_output, 'unicode_escape')
-        except Exception:
-            decoded_str = raw_output
-
-        try:
-            full_content = decoded_str.encode('latin-1').decode('utf-8')
-        except Exception:
-            full_content = decoded_str
+        full_content = raw_output
 
         thought_match = re.search(r'<THOUGHT>(.*?)</THOUGHT>', full_content, re.DOTALL)
         json_match = re.search(r'```json\s*(.*?)\s*```', full_content, re.DOTALL)
