@@ -8,7 +8,7 @@ AMAP, Alibaba Group
 
 ## 📋 Overview
 
-Progressive Implicit CoT distillation training framework of GPlan. Uses **curriculum learning** to compress structured CoT texts into special think tokens epoch by epoch, distilling implicit reasoning capabilities.
+Progressive Implicit CoT Distillation (PICD) training framework of GPlan. It uses **curriculum learning** to compress structured CoT text into fixed-length latent think-token blocks and uses a compression-aware learning-rate schedule (CALR) for the structure-to-polish transition.
 
 <div align="center">
 <img src="gplan_framework.png" alt="GPlan Framework" width="100%"/>
@@ -68,65 +68,67 @@ Each label is an **intent sequence** — a JSON array of tool-calling intents re
 
 The intent library includes 10 tool types covering scenarios such as ride-hailing, navigation, transit, POI recommendation, order reminders, weather queries, etc.
 
-> **Note:** The CoT (Chain-of-Thought) reasoning text used during training is **not included** in the public dataset release. Only the final intent sequences are provided as labels.
+### PICD Training Data Preparation
 
-### Preparing CoT Text for Training
+The released CSV files provide final intent sequences as labels. To run PICD training, prepare a CoT-augmented CSV with the same schema as `train.csv`, where `raw_labels` contains a structured CoT followed by the final intent sequence.
 
-The training pipeline relies on the `raw_labels` column in the CSV, which must contain **both** the CoT reasoning text and the intent sequence JSON. Since the public dataset only provides the final intent sequences, you need to generate the CoT text yourself before training.
+**Step 1: Prepare structured CoT**
 
-**Step 1: Generate CoT text using a large language model**
-
-Use a capable LLM (e.g., GPT, Qwen) to generate structured CoT reasoning for each sample. The CoT must follow this XML-tagged format:
+For each training sample, generate a concise reasoning trace from the user profile, behavior history, current context, and gold intent sequence. The CoT should explain why the plan is reasonable, with each `<STEP_n>` aligned to the n-th intent in the JSON label:
 
 ```
 <THOUGHT>
-<CONTEXT>Briefly analyze the current context and the user's potential needs</CONTEXT>
-<STRATEGY>Based on the context analysis, devise the core strategy for the plan</STRATEGY>
-<STEP_1>Focus on analyzing the primary and most crucial intent</STEP_1>
+<CONTEXT>Briefly analyze the current context and user profile</CONTEXT>
+<STRATEGY>Describe the planning strategy</STRATEGY>
+<STEP_1>Explain the first recommended intent</STEP_1>
 ...
-<STEP_n>Explain why the n-th intent is recommended</STEP_n>
+<STEP_n>Explain the n-th recommended intent</STEP_n>
 </THOUGHT>
 ```
 
-> The number of `<STEP_n>` tags **must equal** the number of intents in the JSON array.
+The number of `<STEP_n>` fields should match the number of intents in the JSON array.
 
-**Step 2: Combine CoT and intent JSON into `raw_labels`**
+**Step 2: Write `raw_labels`**
 
-Concatenate the CoT text and the intent JSON array into a single string, and write it to the `raw_labels` column of your CSV:
+Concatenate the CoT and JSON intent sequence in `raw_labels`:
 
 ```
 <THOUGHT><CONTEXT>...</CONTEXT><STRATEGY>...</STRATEGY><STEP_1>...</STEP_1><STEP_2>...</STEP_2><STEP_3>...</STEP_3></THOUGHT>[{"工具名称":"tool_5","起始位置":"当前位置","空间范围":"附近","tag":"美食"},{"工具名称":"tool_2","起始位置":"当前位置","终点位置":"家"},{"工具名称":"tool_7","tag":"景点"}]
 ```
 
-The training collator (`ProgressiveCotDistillCollater`) will automatically parse this field, extract the CoT and JSON parts, and apply progressive distillation during training.
+The collator parses this field and applies progressive implicit CoT distillation automatically.
 
 ## 🚀 Quick Start
 
-### Training
+### Evaluation on the Public Dataset
 
 ```bash
 pip install -r requirements.txt
-bash finetune.sh
-```
-
-### Testing
-
-```bash
 bash test.sh
 ```
+
+The test script reports the offline metrics used in the paper: `Acc@1`, `NDCG@3`, and `NES` (normalized edit similarity). It can use the JSON-only labels included in `data_process/dataset/test.csv`.
+
+### PICD Training
+
+```bash
+TRAIN_CSV=/path/to/cot_augmented_train.csv bash finetune.sh
+```
+
+`finetune.sh` uses `--cot_mode=latent_multi_cot` and expects CoT-augmented `raw_labels`.
 
 ## 📁 Project Structure
 
 ```
 ├── finetune.py                         # Training script (WeightedLossTrainer + SyncEpochCallback)
 ├── finetune.sh                         # Training launch script
-├── test.py                             # Test script (Accuracy, Edit Similarity, NDCG@3)
+├── test.py                             # Test script (Acc@1, NDCG@3, NES)
 ├── test.sh                             # Test launch script
 ├── data_process/
 │   ├── dataset/
 │   │   ├── train.csv                   # Training dataset (anonymized)
 │   │   └── test.csv                    # Test dataset (anonymized)
-│   ├── collate_fns.py                  # Data collator (progressive distillation)
+│   ├── collate_fns.py                  # PICD data collator
 │   └── data_loader.py                  # CSV data loading
 ├── utils.py                            # Utility functions and argument definitions
 ├── add_tokens/extended_cot_vocabs.json  # CoT special token vocabulary

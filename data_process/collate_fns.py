@@ -13,6 +13,96 @@ import inspect
 import torch
 
 
+SUPPORTED_COT_MODES = {"latent_multi_cot"}
+LATENT_MODES = {"latent_multi_cot"}
+
+
+def normalize_cot_mode(mode):
+    mode = mode or "latent_multi_cot"
+    if mode not in SUPPORTED_COT_MODES:
+        raise ValueError(f"Unsupported cot_mode={mode!r}; choose from {sorted(SUPPORTED_COT_MODES)}")
+    return mode
+
+
+def align_qwen3_prompt_to_assistant_header(prompt_text):
+    """Keep prompt-only text at the assistant header, matching SFT labels."""
+    if not prompt_text or not isinstance(prompt_text, str):
+        return prompt_text
+    return re.sub(
+        r'(<\|im_start\|>assistant\n)<think>\s*</think>\s*$',
+        r'\1',
+        prompt_text,
+        flags=re.DOTALL,
+    )
+
+
+def _is_valid_token_id(token_id, tokenizer):
+    if token_id is None or not isinstance(token_id, int) or token_id < 0:
+        return False
+    unk_token_id = getattr(tokenizer, "unk_token_id", None)
+    return unk_token_id is None or token_id != unk_token_id
+
+
+def get_assistant_end_token(tokenizer):
+    """Prefer the chat assistant terminator; fall back to tokenizer EOS."""
+    im_end_token = "<|im_end|>"
+    im_end_token_id = tokenizer.convert_tokens_to_ids(im_end_token)
+    if _is_valid_token_id(im_end_token_id, tokenizer):
+        return im_end_token
+    if getattr(tokenizer, "eos_token", None):
+        return tokenizer.eos_token
+    raise ValueError("Could not determine assistant end token from tokenizer")
+
+
+def append_assistant_end_token(response_text, tokenizer):
+    if response_text is None:
+        response_text = ""
+    end_token = get_assistant_end_token(tokenizer)
+    known_end_tokens = [end_token, getattr(tokenizer, "eos_token", None), "<|im_end|>"]
+    stripped_response = response_text.rstrip()
+    if any(token and stripped_response.endswith(token) for token in known_end_tokens):
+        return response_text
+    return response_text + end_token
+
+
+def _extract_json_array_text(text):
+    """Extract the first complete JSON array outside THOUGHT blocks."""
+    if not text:
+        return ""
+
+    code_block = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
+    if code_block:
+        return code_block.group(1).strip()
+
+    search_space = re.sub(r'<THOUGHT>.*?</THOUGHT>', '', text, flags=re.DOTALL)
+    start_idx = search_space.find("[")
+    if start_idx == -1:
+        return ""
+
+    stack = 0
+    in_string = False
+    escape = False
+    for idx in range(start_idx, len(search_space)):
+        ch = search_space[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "[":
+            stack += 1
+        elif ch == "]":
+            stack -= 1
+            if stack == 0:
+                return search_space[start_idx:idx + 1].strip()
+    return ""
+
+
 class ProgressiveCotDistillCollater:
     """
     During training, progressively compress structured CoT tags into special tokens via curriculum learning:
@@ -22,15 +112,18 @@ class ProgressiveCotDistillCollater:
     - ...
     - Epoch N: All tags are compressed into special tokens
 
-    Supports both 'forward' (front-to-back) and 'backward' (back-to-front) compression directions.
+    PICD follows the paper's forward compression order: CONTEXT, STRATEGY, STEP_1, ...
     """
 
-    def __init__(self, tokenizer=None, max_length=None, applied_tokenizer=False,
-                 cot_weight=1.0, json_weight=1.0, distill_direction='forward'):
-        self.mode = 'progressive_cot_distill'
+    def __init__(self, mode='latent_multi_cot', tokenizer=None, max_length=None, applied_tokenizer=False,
+                 cot_weight=1.0, json_weight=1.0):
+        self.mode = normalize_cot_mode(mode)
         self.epoch = 1
-        self.distill_direction = distill_direction
         self.last_printed_epoch = 0
+        self.prompt_truncated_count = 0
+        self.response_truncated_count = 0
+        self.picd_total_blocks_hist = {}
+        self.picd_fold_count_hist = {}
         self.applied_tokenizer = applied_tokenizer
         self.tokenizer = tokenizer
         if self.tokenizer and self.tokenizer.pad_token is None:
@@ -43,12 +136,7 @@ class ProgressiveCotDistillCollater:
         self.cot_weight = cot_weight
         self.json_weight = json_weight
 
-        self.SYSTEM_PROMPT = """你是一个顶级的地图出行规划专家。你的任务是基于用户的综合信息，预测并生成一个符合逻辑、有时空感知的意图规划序列。
-#核心策略
-**重点分析用户当下最核心的第一个意图，后续意图序列是第一个意图的后续意图或者其他并列意图。**整个序列必须逻辑自洽、符合普通人的行为模式，并对时间和地点敏感（如饭点推美食），**序列有一定丰富度，长度大于3**
-#输出规则
-1.严格从意图库选择工具，根据公参填充参数，确保时空合理性，不得输出任何其它tag（包括但不限于：便利店、咖啡、饮品、公园、度假村、小吃快餐、夜宵、超市等）
-2.你的输出必须由高度浓缩思维链和意图规划组成，思维链必须使用XML标签`<THOUGHT>...</THOUGHT>`包裹，意图规划必须使用JSON数组包裹，**XML中的<STEP_n>标签数量必须严格等于JSON数组中的意图数量**，模板如下: 
+        output_rule = """2.你的输出必须由高度浓缩思维链和意图规划组成，思维链必须使用XML标签`<THOUGHT>...</THOUGHT>`包裹，意图规划必须使用JSON数组包裹，**XML中的<STEP_n>标签数量必须严格等于JSON数组中的意图数量**，模板如下:
 <THOUGHT>
 <CONTEXT>简要分析当前时空以及用户整体画像</CONTEXT>
 <STRATEGY>基于上下文分析，思考本次规划的核心策略</STRATEGY>
@@ -57,7 +145,14 @@ class ProgressiveCotDistillCollater:
 ...
 <STEP_n>说明为什么推荐第n个意图</STEP_n>
 </THOUGHT>
-[{"工具名称":"...","参数名":"..."}] //必须从意图库中选择工具名称，若该意图存在参数则从公参枚举中选择并填充，一共n个意图
+[{"工具名称":"...","参数名":"..."}] //必须从意图库中选择工具名称，若该意图存在参数则从公参枚举中选择并填充，一共n个意图"""
+
+        self.SYSTEM_PROMPT = f"""你是一个顶级的地图出行规划专家。你的任务是基于用户的综合信息，预测并生成一个符合逻辑、有时空感知的意图规划序列。
+#核心策略
+**重点分析用户当下最核心的第一个意图，后续意图序列是第一个意图的后续意图或者其他并列意图。**整个序列必须逻辑自洽、符合普通人的行为模式，并对时间和地点敏感（如饭点推美食），**序列有一定丰富度，长度大于3**
+#输出规则
+1.严格从意图库选择工具，根据公参填充参数，确保时空合理性，不得输出任何其它tag（包括但不限于：便利店、咖啡、饮品、公园、度假村、小吃快餐、夜宵、超市等）
+{output_rule}
 #可用意图库
 ##公参枚举
 -起始位置:["当前位置","前一位推荐结果","订单目的地"]
@@ -65,19 +160,19 @@ class ProgressiveCotDistillCollater:
 -空间范围:["附近","商圈","全城"]
 -tag:["美食","购物","酒店","景点","休闲娱乐","运动健身","丽人","加油站","充电站","停车场"]
 ##意图
--{"工具名称":"tool_1","起始位置":"...","终点位置": "..."}//打车
--{"工具名称":"tool_2","起始位置":"...","终点位置": "..."}//出行
--{"工具名称":"tool_3"}//长途交通
--{"工具名称":"tool_4"}//周边公交
--{"工具名称":"tool_5","起始位置":"...","空间范围":"...","tag":"..."}//兴趣推荐
--{"工具名称":"tool_6"}//单poi真实到店展示
--{"工具名称":"tool_7","tag":"..."}//附近单poi推荐
--{"工具名称":"tool_8"}//订单提醒
--{"工具名称":"tool_9"}//查天气
--{"工具名称":"tool_10"}//写评价
+-{{"工具名称":"tool_1","起始位置":"...","终点位置": "..."}}//打车
+-{{"工具名称":"tool_2","起始位置":"...","终点位置": "..."}}//出行
+-{{"工具名称":"tool_3"}}//长途交通
+-{{"工具名称":"tool_4"}}//周边公交
+-{{"工具名称":"tool_5","起始位置":"...","空间范围":"...","tag":"..."}}//兴趣推荐
+-{{"工具名称":"tool_6"}}//单poi真实到店展示
+-{{"工具名称":"tool_7","tag":"..."}}//附近单poi推荐
+-{{"工具名称":"tool_8"}}//订单提醒
+-{{"工具名称":"tool_9"}}//查天气
+-{{"工具名称":"tool_10"}}//写评价
 #严格要求
 -绝对禁止输出枚举外的值或工具名
--互斥组：{tool_1, tool_2, tool_4}在一个plan中最多出现一次
+-互斥组：{{tool_1, tool_2, tool_4}}在一个plan中最多出现一次
 -终点位置/起始位置禁止输出具体POI名称，只能填枚举值
 -若想表达的tag不在枚举内，必须就近映射（如：便利店/超市/零食/日杂→购物，咖啡/饮品/奶茶/甜品/夜宵/小吃快餐/餐厅/家常菜→美食，公园/度假村/自然风光/景区→景点，KTV/酒吧/Livehouse→休闲娱乐）"""
 
@@ -108,6 +203,28 @@ class ProgressiveCotDistillCollater:
         """Set current epoch to control progressive distillation progress."""
         self.epoch = epoch
 
+    @staticmethod
+    def _decode_raw_text(raw_output):
+        if not isinstance(raw_output, str):
+            raw_output = str(raw_output or "")
+        try:
+            decoded_str = codecs.decode(raw_output, 'unicode_escape')
+        except Exception:
+            decoded_str = raw_output
+        try:
+            return decoded_str.encode('latin-1').decode('utf-8')
+        except Exception:
+            return decoded_str
+
+    def _get_distill_fold_count(self, thought_content, fold_order):
+        """Return how many semantic tags should be replaced at this effective distill epoch."""
+        del thought_content
+        return min(max(0, int(self.epoch) - 1), len(fold_order))
+
+    def _record_picd_block_stats(self, total_blocks, folded_blocks):
+        self.picd_total_blocks_hist[total_blocks] = self.picd_total_blocks_hist.get(total_blocks, 0) + 1
+        self.picd_fold_count_hist[folded_blocks] = self.picd_fold_count_hist.get(folded_blocks, 0) + 1
+
     def _progressive_distill_multi(self, thought_content):
         """
         Multi-token progressive distillation: replace each tag's content with 3 special placeholder tokens.
@@ -134,12 +251,10 @@ class ProgressiveCotDistillCollater:
         ]
         present_steps = [s for s in all_possible_steps if f"<{s}>" in thought_content]
 
-        if self.distill_direction == 'forward':
-            fold_order = ["CONTEXT", "STRATEGY"] + present_steps
-        else:
-            fold_order = list(reversed(present_steps)) + ["STRATEGY", "CONTEXT"]
+        fold_order = ["CONTEXT", "STRATEGY"] + present_steps
 
-        num_to_fold = max(0, int(self.epoch) - 1)
+        num_to_fold = self._get_distill_fold_count(thought_content, fold_order)
+        self._record_picd_block_stats(len(fold_order), num_to_fold)
         tags_to_fold = fold_order[:num_to_fold]
 
         distilled_text = thought_content
@@ -157,18 +272,12 @@ class ProgressiveCotDistillCollater:
         if not raw_output:
             return None
 
-        full_content = raw_output
+        full_content = self._decode_raw_text(raw_output)
 
         thought_match = re.search(r'<THOUGHT>(.*?)</THOUGHT>', full_content, re.DOTALL)
-        json_match = re.search(r'```json\s*(.*?)\s*```', full_content, re.DOTALL)
 
         thought_content = thought_match.group(1).strip() if thought_match else ""
-        json_raw = json_match.group(1).strip() if json_match else ""
-
-        if not json_raw:
-            fallback_json = re.search(r'(\[.*\])', full_content, re.DOTALL)
-            if fallback_json:
-                json_raw = fallback_json.group(1).strip()
+        json_raw = _extract_json_array_text(full_content)
 
         try:
             plan_obj = json.loads(json_raw)
@@ -176,15 +285,18 @@ class ProgressiveCotDistillCollater:
         except (json.JSONDecodeError, TypeError):
             return None
 
+        if not thought_content and not self.applied_tokenizer:
+            return clean_json_str
+
         if thought_content:
             thought_distilled = self._progressive_distill_multi(thought_content)
             thought_compressed = re.sub(r'\s+', ' ', thought_distilled)
             thought_compressed = re.sub(r'>\s+<', '><', thought_compressed)
             clean_thought_tag = f"<THOUGHT>{thought_compressed.strip()}</THOUGHT>"
         else:
-            clean_thought_tag = ""
+            return None
 
-        return f"{clean_thought_tag}{clean_json_str}" if clean_thought_tag else clean_json_str
+        return f"{clean_thought_tag}{clean_json_str}"
 
     def _get_empty_sample(self):
         """Return None to indicate this sample should be filtered out."""
@@ -267,43 +379,35 @@ class ProgressiveCotDistillCollater:
         if supports_thinking:
             template_kwargs['enable_thinking'] = False
 
-        full_text = tokenizer.apply_chat_template(messages, **template_kwargs)
-
         prompt_messages = messages[:-1]
         prompt_kwargs = dict(tokenize=False, add_generation_prompt=True)
         if supports_thinking:
             prompt_kwargs['enable_thinking'] = False
         prompt_text = tokenizer.apply_chat_template(prompt_messages, **prompt_kwargs)
+        prompt_text = align_qwen3_prompt_to_assistant_header(prompt_text)
+        response_text = append_assistant_end_token(messages[-1]["content"], tokenizer)
 
-        full = tokenizer(
-            full_text, truncation=True, max_length=self.max_length,
-            padding="max_length", return_tensors="pt",
-        )
-        prompt = tokenizer(
-            prompt_text, truncation=True, max_length=self.max_length,
-            padding="max_length", return_tensors="pt",
-        )
+        prompt_ids_raw = tokenizer(prompt_text, add_special_tokens=False, truncation=False)["input_ids"]
+        response_ids = tokenizer(response_text, add_special_tokens=False, truncation=False)["input_ids"]
+        if len(response_ids) >= self.max_length:
+            self.response_truncated_count += 1
+            response_ids = response_ids[-self.max_length:]
+            prompt_ids = []
+        else:
+            prompt_budget = self.max_length - len(response_ids)
+            prompt_ids = prompt_ids_raw[-prompt_budget:]
+            if len(prompt_ids_raw) > len(prompt_ids):
+                self.prompt_truncated_count += 1
 
-        input_ids = full.input_ids[0]
-        attention_mask = full.attention_mask[0]
-        labels = input_ids.clone()
-        full_len = attention_mask.sum().item()
+        sequence_ids = prompt_ids + response_ids
+        full_len = len(sequence_ids)
+        prompt_len = len(prompt_ids)
+        pad_len = self.max_length - full_len
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
-        assistant_marker = "<|im_start|>assistant\n"
-        assistant_marker_ids = tokenizer.encode(assistant_marker, add_special_tokens=False)
-
-        prompt_len = None
-        input_ids_list = input_ids.tolist()
-        for i in range(len(input_ids_list) - len(assistant_marker_ids) + 1):
-            if input_ids_list[i:i + len(assistant_marker_ids)] == assistant_marker_ids:
-                prompt_len = i + len(assistant_marker_ids)
-                break
-
-        if prompt_len is None:
-            prompt_len = prompt.attention_mask[0].sum().item()
-
-        labels[:prompt_len] = -100
-        labels[attention_mask == 0] = -100
+        input_ids = torch.tensor(sequence_ids + [pad_token_id] * pad_len, dtype=torch.long)
+        attention_mask = torch.tensor([1] * full_len + [0] * pad_len, dtype=torch.long)
+        labels = torch.tensor([-100] * prompt_len + response_ids + [-100] * pad_len, dtype=torch.long)
 
         # token_weights and token_types are used by WeightedLossTrainer
         token_weights = torch.ones_like(labels, dtype=torch.float32)
@@ -311,7 +415,7 @@ class ProgressiveCotDistillCollater:
 
         assistant_start = prompt_len
         assistant_ids = input_ids[assistant_start:full_len]
-        assistant_text = messages[2]['content'] if len(messages) > 2 else ""
+        assistant_text = messages[-1]['content'] if len(messages) > 2 else ""
 
         cot_start, cot_end, json_start, json_end = self._find_cot_json_boundary(
             assistant_ids, assistant_text, tokenizer

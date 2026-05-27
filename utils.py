@@ -23,22 +23,29 @@ def parse_dataset_args(parser):
 
 def parse_train_args(parser):
     parser.add_argument("--optim", type=str, default="adamw_torch", help='Optimizer name')
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--epochs", type=int, default=13)
+    parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--per_device_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=2)
     parser.add_argument("--logging_step", type=int, default=10)
     parser.add_argument("--model_max_length", type=int, default=2048)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--cot_mode", type=str, default='progressive_cot_distill',
-                        help="CoT mode (default: progressive_cot_distill)")
-    parser.add_argument("--distill_direction", type=str, default='backward',
-                        choices=['forward', 'backward'],
-                        help="Distill direction: 'forward' (CONTEXT first) or 'backward' (last STEP first)")
-    parser.add_argument("--cot_weight", type=float, default=0.5,
-                        help="Loss weight for CoT tokens (default: 0.5)")
+    parser.add_argument("--cot_mode", type=str, default='latent_multi_cot',
+                        choices=['latent_multi_cot'],
+                        help="PICD training target format.")
+    parser.add_argument("--cot_weight", type=float, default=1.0,
+                        help="Section weight for CoT/latent-prefix loss")
     parser.add_argument("--json_weight", type=float, default=1.0,
-                        help="Loss weight for JSON tokens (default: 1.0)")
+                        help="Section weight for JSON-plan loss")
+    parser.add_argument("--picd_lr_schedule", type=str, default="compression_aware",
+                        choices=["none", "compression_aware"],
+                        help="PICD-aware LR schedule. Enabled by default for latent_multi_cot.")
+    parser.add_argument("--picd_lr_target_compressed_blocks", type=int, default=9,
+                        help="Keep structure LR until this many PICD semantic blocks have been compressed.")
+    parser.add_argument("--picd_polish_lr", type=float, default=1e-6,
+                        help="Low LR after the PICD structure phase.")
+    parser.add_argument("--picd_polish_decay_epochs", type=float, default=0.0,
+                        help="Optional polish cosine decay horizon in physical epochs.")
     parser.add_argument("--resume_from_checkpoint", type=str, default=None,
                         help="Path to pretrained model or checkpoint")
     parser.add_argument("--warmup_ratio", type=float, default=0.01)
@@ -46,6 +53,9 @@ def parse_train_args(parser):
     parser.add_argument("--fp16", action="store_true", default=False)
     parser.add_argument("--bf16", action="store_true", default=False)
     parser.add_argument("--deepspeed", type=str, default="./config/ds_z3_bf16.json")
+    parser.add_argument("--save_strategy", type=str, default="no", choices=["no", "steps", "epoch"])
+    parser.add_argument("--save_steps", type=int, default=1000)
+    parser.add_argument("--save_total_limit", type=int, default=1)
     return parser
 
 

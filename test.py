@@ -6,7 +6,7 @@ Key differences from g_plan:
 - Uses local CSV files (CSVDataset) instead of ODPS tables
 - Uses ProgressiveCotDistillCollater instead of gplan_amap_odps_raw_collater
 - Tool names are anonymized (tool_1 ~ tool_10)
-- Metrics: First Intent Accuracy, Avg Weighted Edit Similarity, NDCG@3 (tool_tag)
+- Metrics: Acc@1, NDCG@3, NES
 - Supports DDP multi-GPU inference with metric aggregation
 """
 
@@ -17,6 +17,7 @@ import random
 import math
 import json
 import re
+import inspect
 
 import torch
 import torch.distributed as dist
@@ -24,7 +25,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 from datasets import Dataset
 
-from data_process.collate_fns import ProgressiveCotDistillCollater
+from data_process.collate_fns import ProgressiveCotDistillCollater, align_qwen3_prompt_to_assistant_header
 from data_process.data_loader import CSVDataset
 from utils import parse_global_args, parse_train_args, parse_dataset_args, set_seed, ensure_dir
 
@@ -225,7 +226,7 @@ def normalized_edit_similarity(sequence_a, sequence_b, tool_mismatch_cost=1.0, p
 
 def ndcg_at_k_tool_tag(pred_seq, label_seq, k=3):
     """
-    Compute NDCG@K using tool_tag matching (tool name + tag parameter).
+    Compute NDCG@K using tool + tag matching.
     Relevance is 1 if a predicted intent matches any label intent by tool_tag, else 0.
     """
     if not label_seq:
@@ -306,6 +307,7 @@ def test(args):
 
     # ---- 2. Load validation data from CSV ----
     collater = ProgressiveCotDistillCollater(
+        mode=args.cot_mode,
         applied_tokenizer=False,
         tokenizer=tokenizer
     )
@@ -341,12 +343,11 @@ def test(args):
 
         for msgs in batch_examples['messages']:
             prompt_messages = msgs[:-1]
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False
-            )
+            template_kwargs = dict(tokenize=False, add_generation_prompt=True)
+            if 'enable_thinking' in inspect.signature(tokenizer.apply_chat_template).parameters:
+                template_kwargs['enable_thinking'] = False
+            prompt_text = tokenizer.apply_chat_template(prompt_messages, **template_kwargs)
+            prompt_text = align_qwen3_prompt_to_assistant_header(prompt_text)
 
             prompt_enc = tokenizer(
                 prompt_text,
@@ -489,7 +490,7 @@ def test(args):
         )
         total_edit_similarity += edit_sim
 
-        # NDCG@3 (tool_tag mode)
+        # NDCG@3
         ndcg_val = ndcg_at_k_tool_tag(pred_seq, label_seq, k=3)
         total_ndcg_at_3 += ndcg_val
 
@@ -507,8 +508,8 @@ def test(args):
             print(f"  Pred sequence ({len(pred_seq)}): {pred_seq}")
             print(f"  Label sequence ({len(label_seq)}): {label_seq}")
             print(f"  First intent match: {pred_intent == label_intent}")
-            print(f"  Edit similarity: {edit_sim:.4f}")
-            print(f"  NDCG@3 (tool_tag): {ndcg_val:.4f}")
+            print(f"  NES: {edit_sim:.4f}")
+            print(f"  NDCG@3: {ndcg_val:.4f}")
 
     # ---- 7. Aggregate across ranks (DDP) ----
     if ddp:
@@ -536,13 +537,9 @@ def test(args):
         print(f"\n{'=' * 60}")
         print(f"  Final Metrics ({total} samples)")
         print(f"{'=' * 60}")
-        print(f"  First Intent Accuracy:        {accuracy:.4f} ({first_intent_correct}/{total})")
-        print(f"  Avg Weighted Edit Similarity: {avg_edit_sim:.4f}")
-        print(f"  NDCG@3 (tool_tag):            {avg_ndcg_at_3:.4f}")
-        print(f"{'=' * 60}")
-        print(f"\n  [Config]")
-        print(f"  tool_mismatch_cost: {args.tool_mismatch_cost}")
-        print(f"  param_mismatch_cost: {args.param_mismatch_cost}")
+        print(f"  Acc@1:  {accuracy:.4f} ({first_intent_correct}/{total})")
+        print(f"  NDCG@3: {avg_ndcg_at_3:.4f}")
+        print(f"  NES:    {avg_edit_sim:.4f}")
         print(f"{'=' * 60}")
 
     # Cleanup
