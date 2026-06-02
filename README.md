@@ -135,3 +135,18 @@ TRAIN_CSV=/path/to/cot_augmented_train.csv bash finetune.sh
 ├── config/ds_z3_bf16.json              # DeepSpeed ZeRO-3 configuration
 └── requirements.txt
 ```
+
+## 📝 Citation
+
+If you find our work useful in your research, please consider citing:
+
+```bibtex
+@misc{wang2026generative,
+    title={Generative Spatiotemporal Intent Sequence Recommendation via Implicit Reasoning in Amap},
+    author={Sicong Wang and Ruiting Dong and Yue Liu and Bowen Zheng and Jun Meng and Jie Li and Shuaijun Guo and Yu Gu and Fanyi Di and Xin Li},
+    year={2026},
+    eprint={2605.28888},
+    archivePrefix={arXiv},
+    primaryClass={cs.IR}
+}
+```
